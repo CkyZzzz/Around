@@ -8,19 +8,30 @@ import (
 	"strconv"
 	"reflect"
 	"github.com/pborman/uuid"
+	"context"
+	//"cloud.google.com/go/bigtable"
 	elastic "gopkg.in/olivere/elastic.v3"
+	"cloud.google.com/go/storage"
+    "io"
+    "strings"
+    "time"
+    "github.com/auth0/go-jwt-middleware"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
+    "github.com/go-redis/redis"
 )
 
 const (
 	DISTANCE = "200km"
 	INDEX = "around"
 	TYPE = "post"
-	// Needs to update
-	//PROJECT_ID = "around-xxx"
-	//BT_INSTANCE = "around-post"
 	// Needs to update this URL if you deploy it to cloud.
-	ES_URL = "http://35.185.112.180:9200"
-
+	ES_URL = "http://35.227.127.90:9200"
+	PROJECT_ID = "single-crowbar-185822"
+	//BT_INSTANCE = "around-post"
+	BUCKET_NAME = "post-images-around"
+	ENABLE_MEMCACHE = true
+	REDIS_URL = "redis-10911.c1.us-central1-2.gce.cloud.redislabs.com:10911"
 )
 
 type Location struct {
@@ -33,7 +44,10 @@ type Post struct {
 	User     string `json:"user"`
 	Message  string  `json:"message"`
 	Location Location `json:"location"`
+	Url    string `json:"url"`
 }
+
+var mySigningKey = []byte("secret")
 
 func main() {
 	// Create a client
@@ -69,23 +83,118 @@ func main() {
 	}
 	fmt.Println("started-service")
 	// 把"/post" map 到 handlerPost函数
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
+	r := mux.NewRouter()
+
+	var jwtMiddleware = jwtmiddleware.New(jwtmiddleware.Options{
+		 ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			  return mySigningKey, nil
+		 },
+		 SigningMethod: jwt.SigningMethodHS256,
+	})
+
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+
+	http.Handle("/", r)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func handlerPost(w http.ResponseWriter, r *http.Request) {
 	// Parse from body of request to get a json object.
-	fmt.Println("Received one post request")
-	decoder := json.NewDecoder(r.Body)
-	var p Post
-	if err := decoder.Decode(&p); err != nil {
-		panic(err)
-		return
-	}
+//	fmt.Println("Received one post request")
+//	decoder := json.NewDecoder(r.Body)
+//	var p Post
+//	if err := decoder.Decode(&p); err != nil {
+//		panic(err)
+//		return
+//	}
+//	id := uuid.New()
+//	// Save to ES.
+//	saveToES(&p, id)
+
+    w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+	
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
+
+
+	// 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
+	// After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
+	// If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
+	r.ParseMultipartForm(32 << 20)
+
+	// Parse from form data.
+	fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+	p := &Post{
+				 User: username.(string),
+				 Message: r.FormValue("message"),
+				 Location: Location{
+							Lat: lat,
+							Lon: lon,
+				 },
+		       }
+
 	id := uuid.New()
+
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "Image is not available", http.StatusInternalServerError)
+	    fmt.Printf("Image is not available %v.\n", err)
+	    return
+	}
+
+	ctx := context.Background()
+
+	defer file.Close()
+    // replace it with your real bucket name.
+	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
+	if err != nil {
+				 http.Error(w, "GCS is not set up", http.StatusInternalServerError)
+				 fmt.Printf("GCS is not set up %v\n", err)
+				 return
+    }
+
+	// Update the media link after saving to GCS.
+	p.Url = attrs.MediaLink
+
 	// Save to ES.
-	saveToES(&p, id)
+	saveToES(p, id)
+
+	// Save to BigTable.
+	//saveToBigTable(p, id)
+
+
+//    ctx := context.Background()
+//	// you must update project name here
+//	bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE)
+//	if err != nil {
+//		 panic(err)
+//		 return
+//	}
+//
+//	tbl := bt_client.Open("post")
+//	mut := bigtable.NewMutation()
+//	mut.Set("post", "user", bigtable.Now(), []byte(p.User))
+//	mut.Set("post", "message", bigtable.Now(), []byte(p.Message))
+//	
+//	mut.Set("post", "lat", bigtable.Now(), []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+//	mut.Set("post", "lon", bigtable.Now(), []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+//	
+//	err := tbl.Apply(ctx, id, mut)
+//	if err != nil {
+//		panic(err);
+//		return
+//	}
+//    fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
+
+    
 
 	fmt.Fprintf(w, "Post received: %s\n", p.Message)
 }
@@ -103,6 +212,26 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Printf( "Search received: %f %f %s\n", lat, lon, ran)
+
+    key := r.URL.Query().Get("lat") + ":" + r.URL.Query().Get("lon") + ":" + ran
+	if ENABLE_MEMCACHE {
+		 rs_client := redis.NewClient(&redis.Options{
+			Addr: REDIS_URL,
+			Password: "", // no password set
+			DB: 0,  // use default DB
+		 })
+
+		 val, err := rs_client.Get(key).Result()
+		 if err != nil {
+			fmt.Printf("Redis cannot find the key %s as %v.\n", key, err)
+		 } else {
+			fmt.Printf("Redis find the key %s.\n", key)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(val))
+			return
+		 }
+	}
+
 
 	// Create a client
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
@@ -141,8 +270,9 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	for _, item := range searchResult.Each(reflect.TypeOf(typ)) { // instance of
 		p := item.(Post) // p = (Post) item
 		fmt.Printf("Post by %s: %s at lat %v and lon %v\n", p.User, p.Message, p.Location.Lat, p.Location.Lon)
-		// TODO(student homework): Perform filtering based on keywords such as web spam etc.
-		ps = append(ps, p)
+		if(!containsFilteredWords(&p.Message)){
+		    ps = append(ps, p)
+		}
 	}
 	
 	js, err := json.Marshal(ps)
@@ -151,9 +281,36 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+    if ENABLE_MEMCACHE {
+		rs_client := redis.NewClient(&redis.Options{
+			Addr: REDIS_URL,
+			Password: "", // no password set
+			DB: 0,  // use default DB
+	    })
+
+	    // Set the cache expiration to be 30 seconds
+	    err := rs_client.Set(key, string(js), time.Second*30).Err()
+	    if err != nil {
+			fmt.Printf("Redis cannot save the key %s as %v.\n", key, err)
+	    }
+	}
+
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write(js)
+}
+
+func containsFilteredWords(s *string) bool {
+	filteredWords := []string{
+		"fuck",
+	}
+	for _, word := range filteredWords {
+		if strings.Contains(*s, word) {
+			return true
+		}
+	}
+	return false
 }
 
 // Save a post to ElasticSearch
@@ -164,7 +321,6 @@ func saveToES(p *Post, id string) {
 		panic(err)
 		return
 	}
-
 	// Save it to index
 	_, err = es_client.Index().
 		Index(INDEX).
@@ -179,4 +335,36 @@ func saveToES(p *Post, id string) {
 	}
 
 	fmt.Printf("Post is saved to Index: %s\n", p.Message)
+}
+
+func saveToGCS(ctx context.Context, r io.Reader, bucket, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		 return nil, nil, err
+	}
+	defer client.Close()
+
+	bh := client.Bucket(bucket)
+	// Next check if the bucket exists
+	if _, err = bh.Attrs(ctx); err != nil {
+		 return nil, nil, err
+	}
+
+	obj := bh.Object(name)
+	w := obj.NewWriter(ctx)
+	if _, err := io.Copy(w, r); err != nil {
+		 return nil, nil, err
+	}
+	if err := w.Close(); err != nil {
+		 return nil, nil, err
+	}
+
+	
+    if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+	     return nil, nil, err
+    }
+		
+	attrs, err := obj.Attrs(ctx)
+	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+	return obj, attrs, err
 }
